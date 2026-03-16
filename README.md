@@ -10,7 +10,7 @@
 ---
 
 ## 👨‍💻 Creator
-**Gaurav**
+**Gaurav** **Akshat Jain**
 
 ## 🎯 Key Features
 - **Synthetic Telemetry Simulation**: Generates high-fidelity mock data mimicking F1-style or track telemetry (Speed, RPM, Throttle, Engine Load).
