@@ -1,24 +1,29 @@
-import tkinter as tk
-from tkinter import ttk, messagebox
+import customtkinter as ctk
 import joblib
 import pandas as pd
 import os
+from tkinter import messagebox
+
+# Set appearance and theme
+ctk.set_appearance_mode("dark")
+ctk.set_default_color_theme("green")
 
 MODEL_FILE = 'ecodrive_model.pkl'
 
-class EcoDriveApp:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("EcoDrive: Telemetry-Based Emission Optimizer")
-        self.root.geometry("500x600")
-        self.root.configure(bg="#2c3e50")
-        self.root.resizable(False, False)
-        
+class EcoDriveApp(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+
+        self.title("EcoDrive: Telemetry-Based Emission Optimizer")
+        self.geometry("600x750")
+        self.resizable(False, False)
+
         self.model = None
         self.load_model()
-        
+
+        # UI Components
         self.create_widgets()
-        
+
     def load_model(self):
         if os.path.exists(MODEL_FILE):
             try:
@@ -27,126 +32,147 @@ class EcoDriveApp:
                 messagebox.showerror("Error", f"Failed to load model: {e}")
         else:
             messagebox.showwarning("Warning", f"{MODEL_FILE} not found. Please run train_model.py first.")
-            
+
     def create_widgets(self):
-        # Styling
-        style = ttk.Style()
-        style.theme_use('clam')
-        style.configure('TLabel', background="#2c3e50", foreground="#ecf0f1", font=('Helvetica', 12))
-        style.configure('TButton', font=('Helvetica', 12, 'bold'), background="#27ae60", foreground="white")
-        style.map('TButton', background=[('active', '#2ecc71')])
-        style.configure('TEntry', font=('Helvetica', 12))
-        
-        # Header Frame
-        header_frame = tk.Frame(self.root, bg="#2980b9", pady=20)
-        header_frame.pack(fill=tk.X)
-        header_lbl = tk.Label(header_frame, text="EcoDrive Efficiency Predictor", font=('Helvetica', 16, 'bold'), bg="#2980b9", fg="white")
-        header_lbl.pack()
-        
-        # Input Frame
-        input_frame = tk.Frame(self.root, bg="#2c3e50", pady=20)
-        input_frame.pack(pady=10)
-        
+        # Main Container
+        self.main_frame = ctk.CTkFrame(self, corner_radius=15)
+        self.main_frame.pack(pady=20, padx=20, fill="both", expand=True)
+
+        # Header
+        self.header_label = ctk.CTkLabel(
+            self.main_frame, 
+            text="🌱 EcoDrive Optimizer", 
+            font=ctk.CTkFont(size=26, weight="bold")
+        )
+        self.header_label.pack(pady=(30, 10))
+
+        self.sub_header = ctk.CTkLabel(
+            self.main_frame, 
+            text="Real-time fuel efficiency analytics", 
+            font=ctk.CTkFont(size=14),
+            text_color="gray"
+        )
+        self.sub_header.pack(pady=(0, 20))
+
+        # Input Section
+        self.input_container = ctk.CTkFrame(self.main_frame, fg_color="transparent")
+        self.input_container.pack(pady=10, padx=40, fill="x")
+
         # Speed
-        ttk.Label(input_frame, text="Speed (km/h):").grid(row=0, column=0, padx=10, pady=15, sticky="e")
-        self.speed_var = tk.StringVar()
-        ttk.Entry(input_frame, textvariable=self.speed_var, width=18).grid(row=0, column=1, padx=10, pady=15)
-        
+        self.speed_label = ctk.CTkLabel(self.input_container, text="Speed (km/h)", font=ctk.CTkFont(size=13, weight="bold"))
+        self.speed_label.pack(anchor="w", padx=5)
+        self.speed_entry = ctk.CTkEntry(self.input_container, placeholder_text="e.g. 80", height=40)
+        self.speed_entry.pack(fill="x", pady=(0, 15))
+
         # Engine RPM
-        ttk.Label(input_frame, text="Engine RPM:").grid(row=1, column=0, padx=10, pady=15, sticky="e")
-        self.rpm_var = tk.StringVar()
-        ttk.Entry(input_frame, textvariable=self.rpm_var, width=18).grid(row=1, column=1, padx=10, pady=15)
-        
-        # Throttle Position
-        ttk.Label(input_frame, text="Throttle % (0-100):").grid(row=2, column=0, padx=10, pady=15, sticky="e")
-        self.throttle_var = tk.StringVar()
-        ttk.Entry(input_frame, textvariable=self.throttle_var, width=18).grid(row=2, column=1, padx=10, pady=15)
-        
-        # Engine Load
-        ttk.Label(input_frame, text="Engine Load % (0-100):").grid(row=3, column=0, padx=10, pady=15, sticky="e")
-        self.load_var = tk.StringVar()
-        ttk.Entry(input_frame, textvariable=self.load_var, width=18).grid(row=3, column=1, padx=10, pady=15)
-        
+        self.rpm_label = ctk.CTkLabel(self.input_container, text="Engine RPM", font=ctk.CTkFont(size=13, weight="bold"))
+        self.rpm_label.pack(anchor="w", padx=5)
+        self.rpm_entry = ctk.CTkEntry(self.input_container, placeholder_text="e.g. 2500", height=40)
+        self.rpm_entry.pack(fill="x", pady=(0, 15))
+
+        # Throttle %
+        self.throttle_label = ctk.CTkLabel(self.input_container, text="Throttle % (0-100)", font=ctk.CTkFont(size=13, weight="bold"))
+        self.throttle_label.pack(anchor="w", padx=5)
+        self.throttle_entry = ctk.CTkEntry(self.input_container, placeholder_text="e.g. 30", height=40)
+        self.throttle_entry.pack(fill="x", pady=(0, 15))
+
+        # Engine Load %
+        self.load_label = ctk.CTkLabel(self.input_container, text="Engine Load % (0-100)", font=ctk.CTkFont(size=13, weight="bold"))
+        self.load_label.pack(anchor="w", padx=5)
+        self.load_entry = ctk.CTkEntry(self.input_container, placeholder_text="e.g. 45", height=40)
+        self.load_entry.pack(fill="x", pady=(0, 25))
+
         # Predict Button
-        pred_btn = ttk.Button(self.root, text="Predict Efficiency", command=self.predict, padding=10)
-        pred_btn.pack(pady=15)
-        
-        # Result Frame
-        result_frame = tk.Frame(self.root, bg="#34495e", pady=15, padx=20, bd=2, relief=tk.GROOVE)
-        result_frame.pack(fill=tk.X, padx=30, pady=10)
-        
-        # Result Label
-        self.result_lbl = tk.Label(result_frame, text="Predicted Consumption: -- L/100km", font=('Helvetica', 14, 'bold'), bg="#34495e", fg="#ecf0f1")
-        self.result_lbl.pack(pady=5)
-        
-        # Warning Label
-        self.warning_lbl = tk.Label(result_frame, text="Awaiting Input...", font=('Helvetica', 12, 'bold'), bg="#34495e", fg="#bdc3c7")
-        self.warning_lbl.pack(pady=5)
-        
-        # Recommendation Label
-        self.rec_lbl = tk.Label(result_frame, text="", font=('Helvetica', 11, 'italic'), bg="#34495e", fg="#3498db", wraplength=400)
-        self.rec_lbl.pack(pady=5)
+        self.predict_btn = ctk.CTkButton(
+            self.main_frame, 
+            text="Analyze Efficiency", 
+            command=self.predict,
+            font=ctk.CTkFont(size=16, weight="bold"),
+            height=50,
+            corner_radius=10
+        )
+        self.predict_btn.pack(pady=10, padx=40, fill="x")
+
+        # Result Dashboard
+        self.result_card = ctk.CTkFrame(self.main_frame, fg_color="#2b2b2b", corner_radius=12)
+        self.result_card.pack(pady=20, padx=30, fill="x")
+
+        self.result_value = ctk.CTkLabel(
+            self.result_card, 
+            text="-- L/100km", 
+            font=ctk.CTkFont(size=28, weight="bold"),
+            text_color="#2ecc71"
+        )
+        self.result_value.pack(pady=(15, 5))
+
+        self.status_label = ctk.CTkLabel(
+            self.result_card, 
+            text="Awaiting Telemetry Data...", 
+            font=ctk.CTkFont(size=14, weight="bold"),
+            text_color="gray"
+        )
+        self.status_label.pack(pady=5)
+
+        self.tip_label = ctk.CTkLabel(
+            self.result_card, 
+            text="", 
+            font=ctk.CTkFont(size=12, slant="italic"),
+            wraplength=350,
+            text_color="#3498db"
+        )
+        self.tip_label.pack(pady=(5, 15))
 
     def predict(self):
         if self.model is None:
             messagebox.showerror("Error", "Model not loaded. Please ensure ecodrive_model.pkl is present.")
-            # Attempt to reload just in case they just ran the train script
             self.load_model()
-            if self.model is None:
-                return
-            
+            if self.model is None: return
+
         try:
-            speed = float(self.speed_var.get())
-            rpm = float(self.rpm_var.get())
-            throttle = float(self.throttle_var.get())
-            load = float(self.load_var.get())
-            
-            # Prepare input data for prediction
+            speed = float(self.speed_entry.get())
+            rpm = float(self.rpm_entry.get())
+            throttle = float(self.throttle_entry.get())
+            load = float(self.load_entry.get())
+
             input_df = pd.DataFrame({
                 'Speed': [speed],
                 'Engine_RPM': [rpm],
                 'Throttle_Position': [throttle],
                 'Engine_Load': [load]
             })
-            
-            prediction = self.model.predict(input_df)[0]
-            
-            self.result_lbl.config(text=f"{prediction:.2f} L/100km")
-            
-            # Warning logic: if consumption > 40 L/100km, it's unsustainably high
-            if prediction > 50.0:
-                 self.warning_lbl.config(text="⚠️ WARNING: Unsustainably High Fuel Consumption!", fg="#e74c3c")
-            elif prediction > 30.0:
-                 self.warning_lbl.config(text="⚠️ Moderate Warning: High Fuel Consumption.", fg="#f39c12")
-            else:
-                 self.warning_lbl.config(text="✅ Optimal Driving Efficiency.", fg="#2ecc71")
-                 
-            # Recommendation logic
-            recommendations = []
-            if rpm > 4000 and speed < 100:
-                recommendations.append("Shift to a higher gear to reduce RPM.")
-            if throttle > 70:
-                recommendations.append("Ease off the accelerator to save fuel.")
-            if load > 80:
-                recommendations.append("Engine load is high; try maintaining momentum to reduce strain.")
-            if speed > 120:
-                recommendations.append("Reduce speed to improve aerodynamic efficiency.")
-            
-            if not recommendations and prediction <= 30.0:
-                rec_text = "Keep up the good work! Your driving is highly efficient."
-            elif not recommendations:
-                rec_text = "Consider smoother acceleration and braking to lower consumption."
-            else:
-                rec_text = "💡 Tip: " + " ".join(recommendations)
-                
-            self.rec_lbl.config(text=rec_text)
-                 
-        except ValueError:
-            messagebox.showerror("Input Error", "Please enter valid numeric values for all fields.")
-        except Exception as e:
-            messagebox.showerror("Error", f"An error occurred during prediction: {e}")
 
-if __name__ == '__main__':
-    root = tk.Tk()
-    app = EcoDriveApp(root)
-    root.mainloop()
+            prediction = self.model.predict(input_df)[0]
+            self.result_value.configure(text=f"{prediction:.2f} L/100km")
+
+            # Status and Color Logic
+            if prediction > 50.0:
+                self.status_label.configure(text="⚠️ CRITICALLY HIGH CONSUMPTION", text_color="#e74c3c")
+                self.result_value.configure(text_color="#e74c3c")
+            elif prediction > 30.0:
+                self.status_label.configure(text="🔶 MODERATE CONSUMPTION", text_color="#e67e22")
+                self.result_value.configure(text_color="#e67e22")
+            else:
+                self.status_label.configure(text="✅ OPTIMAL EFFICIENCY", text_color="#2ecc71")
+                self.result_value.configure(text_color="#2ecc71")
+
+            # Recommendations
+            recs = []
+            if rpm > 4000 and speed < 100: recs.append("Upshift to lower RPM.")
+            if throttle > 70: recs.append("Reduce throttle input.")
+            if load > 80: recs.append("High engine strain detected.")
+            if speed > 120: recs.append("High aerodynamic drag.")
+
+            if not recs:
+                rec_text = "Sustainable driving pattern maintained."
+            else:
+                rec_text = "💡 ECO-TIP: " + " | ".join(recs)
+
+            self.tip_label.configure(text=rec_text)
+
+        except ValueError:
+            messagebox.showerror("Input Error", "Please enter valid numeric values.")
+
+if __name__ == "__main__":
+    app = EcoDriveApp()
+    app.mainloop()
+
