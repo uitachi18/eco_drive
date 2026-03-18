@@ -2,3 +2,6 @@ pandas
 numpy
 scikit-learn
 joblib
+customtkinter
+google-generativeai
+python-dotenv
