@@ -10,7 +10,7 @@
 ---
 
 ## 👨‍💻 Creator
-**Gaurav** **Akshat Jain**
+**Gaurav** **&** **Akshat Jain**
 
 ## 🎯 Key Features
 
