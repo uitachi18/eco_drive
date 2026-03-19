@@ -6,8 +6,75 @@ from tkinter import messagebox
 import random
 import time
 import re
+import threading
 import google.generativeai as genai
 from dotenv import load_dotenv
+from vehicle_knowledge import (
+    extract_vin,
+    vpci_decode_vin,
+    carquery_search,
+    parse_year_make_model,
+    vpci_models_for_make_year,
+    parse_make_model,
+    vpci_models_for_make,
+    format_vehicle_profile,
+)
+
+# --- Gemini error handling helpers ---
+_RETRY_IN_SECONDS_RE = re.compile(r"retry in\s+([0-9]+(?:\.[0-9]+)?)s", re.IGNORECASE)
+_RETRY_DELAY_SECONDS_RE = re.compile(r"retry_delay\s*\{\s*seconds:\s*([0-9]+)\s*\}", re.IGNORECASE)
+
+_TELEMETRY_KV_RE = re.compile(
+    r"\b(speed|rpm|engine[_\s-]*rpm|throttle|throttle[_\s-]*position|load|engine[_\s-]*load)\b\s*[:=]?\s*([0-9]+(?:\.[0-9]+)?)",
+    re.IGNORECASE,
+)
+
+def _extract_retry_seconds(error_text: str) -> int | None:
+    if not error_text:
+        return None
+    m = _RETRY_IN_SECONDS_RE.search(error_text)
+    if m:
+        try:
+            return max(0, int(float(m.group(1))))
+        except Exception:
+            return None
+    m = _RETRY_DELAY_SECONDS_RE.search(error_text)
+    if m:
+        try:
+            return max(0, int(m.group(1)))
+        except Exception:
+            return None
+    return None
+
+def _is_quota_429(error_text: str) -> bool:
+    if not error_text:
+        return False
+    t = error_text.lower()
+    return (" 429" in t or "too many requests" in t or "quota exceeded" in t) and (
+        "rate limit" in t or "quota" in t or "exceeded your current quota" in t
+    )
+
+def _parse_telemetry_from_text(text: str) -> dict:
+    """
+    Extract telemetry from free-form text.
+    Returns dict with keys: Speed, Engine_RPM, Throttle_Position, Engine_Load if present.
+    """
+    out: dict[str, float] = {}
+    for key, val in _TELEMETRY_KV_RE.findall(text or ""):
+        k = key.lower().replace(" ", "_").replace("-", "_")
+        try:
+            f = float(val)
+        except Exception:
+            continue
+        if k in ("speed",):
+            out["Speed"] = f
+        elif k in ("rpm", "engine_rpm"):
+            out["Engine_RPM"] = f
+        elif k in ("throttle", "throttle_position"):
+            out["Throttle_Position"] = f
+        elif k in ("load", "engine_load"):
+            out["Engine_Load"] = f
+    return out
 
 # Robust API key loading
 load_dotenv()
@@ -31,6 +98,7 @@ if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
 MODEL_FILE = 'ecodrive_model.pkl'
+GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 
 # Set appearance and theme
 ctk.set_appearance_mode("Dark")
@@ -49,29 +117,31 @@ class EcoDriveApp(ctk.CTk):
         self.model = None
         self.load_model()
         
-        # Initialize Gemini Model
+        # Initialize Gemini Model (Virtual Chief Engineer - "engineer help")
         self.gemini_connected = False
         self.gemini_init_error = None
+        self.gemini_cooldown_until_ts = 0.0
+        self.gemini_quota_blocked = False
+        self._chat_busy = False
         if GEMINI_API_KEY:
             try:
-                # Switching to gemini-1.5-flash which is confirmed available
+                # Gemini model can be overridden via GEMINI_MODEL env var
                 self.gemini_model = genai.GenerativeModel(
-                    model_name="gemini-1.5-flash",
+                    model_name=GEMINI_MODEL_NAME,
                     system_instruction=(
-                        "You are the AutoBot Professional Engineering Consultant, a senior automotive engineer and industry historian. "
-                        "Your goal is to provide profound, technically accurate insights into vehicle engineering, aerodynamics, "
-                        "thermodynamics, and mechanical design. Maintain a formal, authoritative, yet accessible professional tone. "
-                        "Prioritize data on performance metrics, platform architectures, and engineering innovation. "
+                        "You are 'engineer help', an advanced Automotive Engineering AI and Virtual Chief Engineer. "
+                        "Your expertise includes high-performance telemetry analysis, ICE mechanics, EV battery management systems, "
+                        "and UN SDGs 11 and 13. Tone: Professional, expert, data-driven. "
                         "If a query is non-automotive, professionally redirect the user to automotive engineering topics."
                     )
                 )
                 self.gemini_connected = True
-                print("Gemini API Initialized with gemini-1.5-flash.")
+                print(f"Gemini API Initialized for 'engineer help' using {GEMINI_MODEL_NAME}.")
             except Exception as e:
                 print(f"Gemini Init Error: {e}")
-                # Try without system instruction as a final fallback
                 try:
-                    self.gemini_model = genai.GenerativeModel(model_name="gemini-1.5-flash")
+                    # Final fallback without system instruction
+                    self.gemini_model = genai.GenerativeModel(model_name=GEMINI_MODEL_NAME)
                     self.gemini_connected = True
                     print("Gemini API Initialized (Legacy Mode).")
                 except Exception as e2:
@@ -80,70 +150,244 @@ class EcoDriveApp(ctk.CTk):
                     self.gemini_connected = False
         else:
             self.gemini_init_error = "API Key not found."
-            print("No Gemini API Key found in environment or .env file.")
         
-        # Car model database for deep knowledge (Professional Local Fallback)
-        self.model_db = {
-            "fortuner": {
-                "name": "Toyota Fortuner (AN150/AN160)",
-                "era": "modern",
-                "desc": (
-                    "A project of the IMV (Innovative International Multi-purpose Vehicle) platform. "
-                    "Features a robust body-on-frame chassis, double-wishbone front suspension, and a 4-link rear with coil springs. "
-                    "Renowned for high torsional rigidity and exceptional approach/departure angles for off-road traversal."
-                ),
-                "fact": "Engineering Note: Uses a part-time 4WD system with a high/low range transfer case for maximum torque multiplication."
-            },
-            "mustang": {
-                "name": "Ford Mustang (Generation I)",
-                "era": "past",
-                "desc": (
-                    "The progenitor of the Pony Car segment, introduced in 1964. The 1967 GT500 variant featured a "
-                    "428-cubic-inch V8 with dual Holley carburetors, producing approximately 355 brake horsepower. "
-                    "Utilized a unibody construction with an independent front suspension layout."
-                ),
-                "fact": "Historical Note: The 1965 GT350R was a purpose-built competition variant with a modified K-code 289 V8."
-            },
-            "tesla": {
-                "name": "Tesla Model S Plaid",
-                "era": "present",
-                "desc": (
-                    "A tri-motor AWD platform utilizing carbon-sleeved rotors to maintain structural integrity at high RPM (approx 20,000 RPM). "
-                    "Boasts a drag coefficient (Cd) of just 0.208, among the lowest in production vehicles. Features a structural battery pack design."
-                ),
-                "fact": "Technical Note: The Plaid powertrain can sustain over 1,000 hp across the entire power band through advanced thermal management."
-            },
-            "supra": {
-                "name": "Toyota Supra (A80)",
-                "era": "past",
-                "desc": (
-                    "Famous for the 2JZ-GTE inline-6 engine, featuring a cast-iron block and sequential twin-turbochargers. "
-                    "Designed using CAD/CAM systems that were cutting-edge in the early 90s, focusing on high-speed stability and massive braking performance."
-                ),
-                "fact": "Performance Note: The A80's hollow-fiber spoiler and magnesium-alloy steering wheel were key weight-reduction innovations."
-            },
-            "beetle": {
-                "name": "Volkswagen Type 1 (Beetle)",
-                "era": "past",
-                "desc": (
-                    "An air-cooled, rear-engine, rear-wheel-drive layout on a backbone chassis. "
-                    "Engineered for simplicity and durability, featuring a torsion bar suspension system that provided a 'fully independent' setup on a budget."
-                ),
-                "fact": "Design Note: Its silhouette was aerodynamically advanced for 1938, achieving a Cd of approx 0.48."
-            },
-            "porsche 911": {
-                "name": "Porsche 911 (992 Generation)",
-                "era": "present",
-                "desc": (
-                    "The pinnacle of rear-engine evolution. The 992 chassis employs a high percentage of aluminum (approx 70%). "
-                    "Integrated with PASM (Porsche Active Suspension Management) and optional PDCC (Active Roll Stabilization) for superior lateral dynamics."
-                ),
-                "fact": "Engineering Note: The 911's distinctive engine mounting has been moved forward across generations to optimize polar moment of inertia."
-            }
-        }
+        # Local database removed as per user request to rely on Gemini Output.
+        self.model_db = {}
         
         self.create_widgets()
         
+    def _set_chat_busy(self, busy: bool, status_text: str | None = None):
+        self._chat_busy = busy
+        try:
+            state = "disabled" if busy else "normal"
+            self.chat_entry.configure(state=state)
+            self.send_button.configure(state=state)
+        except Exception:
+            pass
+        if status_text:
+            try:
+                self.bot_status_label.configure(text=status_text)
+            except Exception:
+                pass
+
+    def _append_bot_message(self, text: str):
+        self.update_chat_history(f"🛠️ engineer help: {text}\n\n")
+
+    def _respond_in_thread(self, user_msg: str):
+        """
+        Do not call UI methods directly from this thread.
+        Compute response text, then schedule UI updates with self.after().
+        """
+        now = time.time()
+        # If quota blocked or cooling down, always local.
+        force_local = self.gemini_quota_blocked or (now < self.gemini_cooldown_until_ts) or (not self.gemini_connected)
+
+        def finalize(text: str, status: str):
+            self.after(
+                0,
+                lambda: (
+                    self._append_bot_message(text),
+                    self._set_chat_busy(False, status),
+                ),
+            )
+
+        if force_local:
+            if self.gemini_quota_blocked:
+                status = "🛠️ engineer help: Offline (Local Mode)"
+            elif now < self.gemini_cooldown_until_ts:
+                remaining = max(1, int(self.gemini_cooldown_until_ts - now))
+                status = f"🛠️ engineer help: Cooling down… (~{remaining}s)"
+            else:
+                status = "🛠️ engineer help: Offline (Local Mode)"
+            finalize(self.offline_engineer_help(user_msg), status)
+            return
+
+        # Cloud attempt
+        try:
+            response = self.gemini_model.generate_content(user_msg)
+            if response and response.text:
+                finalize(response.text, "🛠️ engineer help: Ready for Optimization")
+                return
+            raise Exception("Empty response or blocked by safety filters.")
+        except Exception as e:
+            err_text = str(e)
+            print(f"Gemini Generation Error: {err_text}")
+            if _is_quota_429(err_text):
+                retry_s = _extract_retry_seconds(err_text) or 30
+                self.gemini_cooldown_until_ts = time.time() + retry_s
+
+                if "limit: 0" in err_text.lower() or "free_tier_requests" in err_text.lower():
+                    self.gemini_quota_blocked = True
+                    local = self.offline_engineer_help(user_msg)
+                    finalize(
+                        "Cloud quota blocked; switched to local mode.\n\n" + local,
+                        "🛠️ engineer help: Offline (Local Mode)",
+                    )
+                else:
+                    local = self.offline_engineer_help(user_msg)
+                    finalize(
+                        f"Rate limited by Gemini API; cooling down ~{retry_s}s. Local response below.\n\n{local}",
+                        "🛠️ engineer help: Cooling down…",
+                    )
+            else:
+                local = self.offline_engineer_help(user_msg)
+                finalize(
+                    "Cloud error; switched to local mode.\n\n" + local,
+                    "🛠️ engineer help: Offline (Local Mode)",
+                )
+
+    def offline_engineer_help(self, user_msg: str) -> str:
+        """
+        Local fallback response generator when Gemini is unavailable.
+        Tries to:
+        - Answer common automotive optimization questions with heuristics
+        - Parse telemetry from the message and (if model loaded) predict L/100km
+        """
+        msg = (user_msg or "").strip()
+        if not msg:
+            return "I’m offline, but ready. Ask about ICE/EV efficiency, gearing, aero, tires, or paste telemetry (speed/rpm/throttle/load)."
+
+        telemetry = _parse_telemetry_from_text(msg)
+        has_all = all(k in telemetry for k in ("Speed", "Engine_RPM", "Throttle_Position", "Engine_Load"))
+
+        lines: list[str] = []
+        lines.append("Offline Engineer Mode (local heuristics).")
+
+        # Vehicle lookup (VIN or year/make/model)
+        vin = extract_vin(msg)
+        if vin:
+            prof = vpci_decode_vin(vin, use_cache=True)
+            if prof:
+                lines.append("")
+                lines.append("Vehicle identification (cached lookup):")
+                lines.append(format_vehicle_profile(prof))
+            else:
+                lines.append("")
+                lines.append("Vehicle identification: VIN detected but lookup failed (offline or service unavailable).")
+
+        # Basic year/make/model attempt (best-effort)
+        if not vin:
+            parsed = parse_year_make_model(msg)
+            if parsed:
+                y, mk, md = parsed
+                prof = carquery_search(y, mk, md, use_cache=True)
+                if prof:
+                    lines.append("")
+                    lines.append("Vehicle trims/specs (cached lookup):")
+                    lines.append(format_vehicle_profile(prof))
+                else:
+                    # vPIC fallback for older vehicles / trim coverage gaps
+                    vp = vpci_models_for_make_year(mk, y, use_cache=True)
+                    if vp:
+                        lines.append("")
+                        lines.append("Vehicle catalog (cached lookup):")
+                        lines.append(format_vehicle_profile(vp))
+                        if md.lower() not in " ".join((vp.data.get("models") or [])).lower():
+                            lines.append(f"- Note: '{md.title()}' not found in vPIC model list for {mk.title()} {y}.")
+                    else:
+                        # Some makes/years return empty from vPIC (especially older years). Try make-only list.
+                        vp2 = vpci_models_for_make(mk, use_cache=True)
+                        if vp2:
+                            lines.append("")
+                            lines.append("Vehicle catalog (cached lookup):")
+                            lines.append(format_vehicle_profile(vp2))
+                            lines.append(f"- Note: vPIC did not return a {y}-specific list for {mk.title()}; showing all-years catalog instead.")
+                            if md.lower() not in " ".join((vp2.data.get("models") or [])).lower():
+                                lines.append(f"- Note: '{md.title()}' not found in vPIC model list for {mk.title()} (all years).")
+                        else:
+                            lines.append("")
+                            lines.append("Vehicle lookup: could not reach vehicle catalog service (check internet) and no cached data found.")
+            else:
+                mm = parse_make_model(msg)
+                if mm:
+                    mk, md = mm
+                    vp = vpci_models_for_make(mk, use_cache=True)
+                    if vp:
+                        lines.append("")
+                        lines.append("Vehicle catalog (cached lookup):")
+                        lines.append(format_vehicle_profile(vp))
+                        if md.lower() not in " ".join((vp.data.get("models") or [])).lower():
+                            lines.append(f"- Note: '{md.title()}' not found in vPIC model list for {mk.title()} (all years).")
+                    else:
+                        lines.append("")
+                        lines.append("Vehicle lookup: could not reach vehicle catalog service (check internet) and no cached data found.")
+
+        # Telemetry-driven advice
+        if telemetry:
+            lines.append("")
+            lines.append("Telemetry detected:")
+            if "Speed" in telemetry:
+                lines.append(f"- Speed: {telemetry['Speed']:.1f} km/h")
+            if "Engine_RPM" in telemetry:
+                lines.append(f"- RPM: {telemetry['Engine_RPM']:.0f}")
+            if "Throttle_Position" in telemetry:
+                lines.append(f"- Throttle: {telemetry['Throttle_Position']:.0f}%")
+            if "Engine_Load" in telemetry:
+                lines.append(f"- Load: {telemetry['Engine_Load']:.0f}%")
+
+            # Model-based prediction if possible
+            if has_all and self.model is not None:
+                try:
+                    input_df = pd.DataFrame(
+                        {
+                            "Speed": [telemetry["Speed"]],
+                            "Engine_RPM": [telemetry["Engine_RPM"]],
+                            "Throttle_Position": [telemetry["Throttle_Position"]],
+                            "Engine_Load": [telemetry["Engine_Load"]],
+                        }
+                    )
+                    pred = float(self.model.predict(input_df)[0])
+                    lines.append("")
+                    lines.append(f"Estimated fuel consumption: {pred:.2f} L/100km (model).")
+                    if pred > 50.0:
+                        lines.append("Status: UNSUSTAINABLE consumption (very high).")
+                    elif pred > 30.0:
+                        lines.append("Status: HIGH consumption.")
+                    else:
+                        lines.append("Status: OPTIMAL efficiency range.")
+                except Exception:
+                    lines.append("")
+                    lines.append("Fuel estimate unavailable (model error).")
+
+            # Heuristic coaching (works even without model)
+            rpm = telemetry.get("Engine_RPM")
+            speed = telemetry.get("Speed")
+            throttle = telemetry.get("Throttle_Position")
+            load = telemetry.get("Engine_Load")
+            tips: list[str] = []
+            if rpm is not None and speed is not None and rpm > 4000 and speed < 100:
+                tips.append("Shift up / reduce RPM (high RPM at low road speed wastes fuel).")
+            if throttle is not None and throttle > 70:
+                tips.append("Soften throttle inputs; aim for smoother pedal ramps.")
+            if load is not None and load > 80:
+                tips.append("High load: avoid abrupt acceleration; keep momentum, reduce grade/drag where possible.")
+            if speed is not None and speed > 120:
+                tips.append("Aerodynamic drag rises fast above ~100–110 km/h; reducing speed is the biggest win.")
+            if tips:
+                lines.append("")
+                lines.append("Optimization actions:")
+                lines.extend([f"- {t}" for t in tips])
+            else:
+                lines.append("")
+                lines.append("Optimization actions: your inputs don’t trigger any major red flags; focus on smoothness and steady-state cruising.")
+
+        # General offline knowledge for common topics
+        lower = msg.lower()
+        if any(w in lower for w in ("mileage", "fuel", "consumption", "mpg", "l/100", "efficiency")) and not telemetry:
+            lines.append("")
+            lines.append("General efficiency levers (ranked): speed (aero), throttle smoothness, gearing/RPM, tire pressure/rolling resistance, unnecessary mass, and maintenance (alignment, plugs, filters).")
+        if any(w in lower for w in ("ev", "battery", "bms", "regen")):
+            lines.append("")
+            lines.append("EV quick wins: precondition battery when possible, moderate speed, use regen strategically (avoid brake-to-zero when you could coast), and keep tires properly inflated.")
+        if any(w in lower for w in ("turbo", "boost", "knock", "octane")):
+            lines.append("")
+            lines.append("Turbo/knock basics: higher load + high IAT increases knock risk; good intercooling, correct octane, and conservative timing/boost targets protect the engine.")
+
+        lines.append("")
+        lines.append("Tip: you can paste a VIN (17 chars) or 'YEAR MAKE MODEL' for cached vehicle lookup.")
+        lines.append("If you want a precise analysis, paste: speed=…, rpm=…, throttle=…, load=… (all four).")
+        return "\n".join(lines)
+
     def load_model(self):
         if os.path.exists(MODEL_FILE):
             try:
@@ -160,7 +404,7 @@ class EcoDriveApp(ctk.CTk):
         self.tabview.grid(row=0, column=0, padx=20, pady=20, sticky="nsew")
         
         self.tabview.add("Predictor")
-        self.tabview.add("AutoBot Professional Engineering Suite")
+        self.tabview.add("engineer help")
         
         self.setup_predictor_tab()
         self.setup_autochat_tab()
@@ -240,12 +484,12 @@ class EcoDriveApp(ctk.CTk):
         self.rec_text_label.pack(padx=20, pady=(0, 20))
 
     def setup_autochat_tab(self):
-        parent = self.tabview.tab("AutoBot Professional Engineering Suite")
+        parent = self.tabview.tab("engineer help")
         parent.grid_columnconfigure(0, weight=1)
         parent.grid_rowconfigure(1, weight=1)
 
         # Status Display
-        self.bot_status_label = ctk.CTkLabel(parent, text="🤖 AutoBot: Senior Engineering Intelligence Online", font=ctk.CTkFont(size=13, weight="bold"), text_color="#00adb5")
+        self.bot_status_label = ctk.CTkLabel(parent, text="🛠️ engineer help: Virtual Chief Engineer Online", font=ctk.CTkFont(size=13, weight="bold"), text_color="#00adb5")
         self.bot_status_label.grid(row=0, column=0, padx=20, pady=(10, 0), sticky="w")
 
         self.chat_frame = ctk.CTkFrame(parent, corner_radius=15, fg_color="#1b1b1b", border_width=1, border_color="#393e46")
@@ -256,13 +500,13 @@ class EcoDriveApp(ctk.CTk):
         self.chat_history = ctk.CTkTextbox(self.chat_frame, font=ctk.CTkFont(size=15), text_color="#eeeeee", fg_color="#0a0a0a", border_color="#393e46")
         self.chat_history.grid(row=0, column=0, columnspan=2, padx=20, pady=20, sticky="nsew")
         
-        init_msg = "🤖 AutoBot: Greetings. I am your Lead Automotive Engineering Consultant.\n"
+        init_msg = "🛠️ engineer help: Telemetry linked. I am your Virtual Chief Engineer.\n"
         if self.gemini_connected:
-            init_msg += "⚡ Status: Gemini GenAI Online (Professional Intelligence Mode)\n"
+            init_msg += "⚡ Status: Gemini GenAI Online (Automotive Expert Mode)\n"
         else:
-            init_msg += f"⚡ Status: Local Engineering DB Only ({self.gemini_init_error if self.gemini_init_error else 'Offline'})\n"
+            init_msg += f"⚡ Status: Offline ({self.gemini_init_error if self.gemini_init_error else 'Check API Key'})\n"
             
-        init_msg += "\nPlease provide a technical query regarding chassis dynamics, engine thermodynamics, or historical platform architectures.\n\n"
+        init_msg += "\nHow can we optimize your vehicle's setup and emissions today?\n\n"
         
         self.chat_history.insert("0.0", init_msg)
         self.chat_history.configure(state="disabled")
@@ -295,7 +539,7 @@ class EcoDriveApp(ctk.CTk):
         if cmd == "clear":
             self.chat_history.configure(state="normal")
             self.chat_history.delete("1.0", "end")
-            self.chat_history.insert("1.0", "🤖 AutoBot: Memory banks cleared. Ready for new input.\n\n")
+            self.chat_history.insert("1.0", "🛠️ engineer help: Memory banks cleared. Ready for new input.\n\n")
             self.chat_history.configure(state="disabled")
             return
         
@@ -310,32 +554,59 @@ class EcoDriveApp(ctk.CTk):
 
         self.update_chat_history(f"You: {user_msg}\n")
         self.chat_entry.delete(0, 'end')
-        
-        # Simulate thinking
-        self.bot_status_label.configure(text="🤖 AutoBot: Scanning Universal Vehicle Database...")
-        self.after(random.randint(800, 1500), lambda: self.process_response(user_msg))
+
+        if self._chat_busy:
+            return
+        self._set_chat_busy(True, "🛠️ engineer help: Analyzing telemetry patterns…")
+        threading.Thread(target=self._respond_in_thread, args=(user_msg,), daemon=True).start()
 
     def process_response(self, user_msg):
-        # 1. Try Gemini First if connected
+        # Only use Gemini as per user request
         if self.gemini_connected:
             try:
-                # Adding some safety settings or just a generic call
                 response = self.gemini_model.generate_content(user_msg)
                 if response and response.text:
                     bot_reply = response.text
-                    self.update_chat_history(f"🤖 AutoBot (GenAI): {bot_reply}\n\n")
+                    self.update_chat_history(f"🛠️ engineer help: {bot_reply}\n\n")
                 else:
                     raise Exception("Empty response or blocked by safety filters.")
             except Exception as e:
-                print(f"Gemini Generation Error: {e}")
-                # Fallback to local
-                bot_reply = self.get_universal_response(user_msg.lower())
-                self.update_chat_history(f"🤖 AutoBot (Offline): {bot_reply}\n\n")
+                err_text = str(e)
+                print(f"Gemini Generation Error: {err_text}")
+                if _is_quota_429(err_text):
+                    retry_s = _extract_retry_seconds(err_text) or 30
+                    self.gemini_cooldown_until_ts = time.time() + retry_s
+
+                    # If the API reports quota limit 0, treat as hard-blocked until user fixes billing/quota.
+                    if "limit: 0" in err_text.lower() or "free_tier_requests" in err_text.lower():
+                        self.gemini_quota_blocked = True
+                        self.bot_status_label.configure(text="🛠️ engineer help: Offline (Local Mode)")
+                        bot_reply = self.offline_engineer_help(user_msg)
+                        self.update_chat_history(
+                            "🛠️ engineer help (System): Cloud quota blocked; switching to local mode.\n"
+                            f"🛠️ engineer help: {bot_reply}\n\n"
+                        )
+                    else:
+                        self.bot_status_label.configure(text="🛠️ engineer help: Cooling down…")
+                        bot_reply = self.offline_engineer_help(user_msg)
+                        self.update_chat_history(
+                            f"🛠️ engineer help (System): Rate limited by Gemini API. Cooling down ~{retry_s}s.\n"
+                            f"🛠️ engineer help: (Local)\n{bot_reply}\n\n"
+                        )
+                else:
+                    bot_reply = self.offline_engineer_help(user_msg)
+                    self.update_chat_history(
+                        "🛠️ engineer help (System): Cloud connection issue; using local mode.\n"
+                        f"🛠️ engineer help: {bot_reply}\n\n"
+                    )
         else:
-            bot_reply = self.get_universal_response(user_msg.lower())
-            self.update_chat_history(f"🤖 AutoBot: {bot_reply}\n\n")
+            bot_reply = self.offline_engineer_help(user_msg)
+            self.update_chat_history(
+                "🛠️ engineer help (System): Cloud is offline (missing API key or init error); using local mode.\n"
+                f"🛠️ engineer help: {bot_reply}\n\n"
+            )
             
-        self.bot_status_label.configure(text="🤖 AutoBot: Ready for Universal Expansion")
+        self.bot_status_label.configure(text="🛠️ engineer help: Ready for Optimization")
 
     def update_chat_history(self, message):
         self.chat_history.configure(state="normal")
@@ -344,61 +615,7 @@ class EcoDriveApp(ctk.CTk):
         self.chat_history.configure(state="disabled")
 
     def get_universal_response(self, message):
-        # 1. Try Specific Model Match First (Fuzzy-ish)
-        for key, data in self.model_db.items():
-            # Check if key is in message (handles "tell me about fortuner")
-            # Improved pattern matching for common car names
-            key_pattern = key.replace(" ", ".*")
-            if re.search(key_pattern, message) or (key == "fortuner" and ("forturner" in message or "fortuner" in message)):
-                return f"Ah, the {data['name']}! {data['desc']}\n\n💡 Fun Fact: {data['fact']}"
-
-        knowledge = {
-            "past": [
-                "In 1886, Karl Benz patented the Motorwagen, the first true automobile. It had 3 wheels and a massive 0.75 horsepower engine!",
-                "The 1920s saw the rise of the Duesenberg Model J, a car so powerful and expensive that it remainded a status symbol for a century.",
-                "Steam-powered buses were actually quite common in London during the early 1800s before the Red Flag Act slowed them down.",
-                "The 1960s was the golden age of muscle cars. The 1969 Dodge Charger Daytona was the first car to break 200 mph in NASCAR history!"
-            ],
-            "present": [
-                "Carbon fiber and active aerodynamics allow modern hypercars like the Rimac Nevera to accelerate from 0-60 mph in under 2 seconds.",
-                "Today's Formula 1 cars use hybrid power units that are over 50% thermally efficient—the highest of any internal combustion engine ever.",
-                "Autonomous Level 3 systems are now appearing on public roads, allowing drivers to take their hands off the wheel in specific conditions.",
-                "Modern trucks are switching to electric and hydrogen fuel cells to reduce the massive carbon footprint of logistics."
-            ],
-            "future": [
-                "By 2040, solid-state batteries are expected to provide 1000km range with 5-minute charge times, effectively ending range anxiety.",
-                "Autonomous Flying Taxis (eVTOL) are undergoing testing in Dubai and NYC, aiming to move urban transport into the third dimension by 2030.",
-                "In the 2050s, vehicle-to-everything (V2X) communication will likely eliminate traffic jams entirely through perfect AI coordination.",
-                "Synthetic fuels (e-fuels) might allow classic internal combustion engines to run with net-zero emissions in the far future."
-            ],
-            "bike": [
-                "Motorcycles are the most efficient form of ICE transport. The Kawasaki Ninja H2R is currently the fastest production bike, reaching 400 km/h.",
-                "Electric bikes (E-Bikes) are the fastest-growing vehicle segment, offering a sustainable future for urban commuting."
-            ],
-            "truck": [
-                "The Tesla Semi aims to revolutionize long-haul trucking with a drag coefficient better than a Bugatti Chiron!",
-                "Hydrogen trucks like the Nikola Tre offer the fast refueling classic diesel drivers are used to, but with zero emissions."
-            ],
-            "formula": ["Formula 1 is the pinnacle of engineering. A modern F1 car generates so much downforce it could theoretically drive upside down in a tunnel!"],
-            "suv": ["SUVs now dominate over 50% of the global car market, leading manufacturers to focus intensely on making these heavy vehicles more aerodynamic."],
-            "luxury": ["Rolls-Royce Spectre is the brand's first fully electric car, proving that silent electric power is the ultimate luxury for a refined ride."]
-        }
-
-        # Context-aware eras
-        if any(w in message for w in ["old", "past", "history", "classic", "vintage", "antique"]):
-            return random.choice(knowledge["past"])
-        if any(w in message for w in ["now", "present", "current", "modern", "today"]):
-            return random.choice(knowledge["present"])
-        if any(w in message for w in ["future", "2050", "tomorrow", "concept", "prediction"]):
-            return random.choice(knowledge["future"])
-            
-        # Specific Categories
-        for key in knowledge:
-            if key in message:
-                return random.choice(knowledge[key])
-        
-        # 3. Conversational Fallback
-        return "I'm always expanding my memory banks! I don't have deep specs on that specific model yet, but I do know a lot about general vehicle history, future concepts, and efficiency optimization. \n\nTry asking me about 'Classic 60s cars', 'Solid state batteries', or a popular model like 'Mustang' or 'Tesla'!"
+        return "Local fallback retired. Please reconnect to the Gemini network."
 
     def predict(self):
         if self.model is None:
